@@ -1,0 +1,5 @@
+__pycache__/
+build/
+*.spec
+dist/config.json
+dist/seen_id.json

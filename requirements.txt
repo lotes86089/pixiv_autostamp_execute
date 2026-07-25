@@ -1,0 +1,4 @@
+requests>=2.32.0
+selenium>=4.20.0
+undetected-chromedriver>=3.5.5
+pyinstaller>=6.10.0
