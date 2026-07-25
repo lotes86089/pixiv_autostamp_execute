@@ -1,4 +1,4 @@
-# Pixiv 自動貼圖桌面版
+# Pixiv 自動貼圖桌面版(codex製作)
 
 執行 `dist\PixivAutoStamp.exe` 後，填入 Pixiv `PHPSESSID` 與 Telegram 資訊，按下「啟動」即可。程式會每 30 秒檢查一次；按「停止」會在目前瀏覽器動作安全結束後停止。
 
