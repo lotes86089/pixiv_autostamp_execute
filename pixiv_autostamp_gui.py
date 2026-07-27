@@ -26,7 +26,6 @@ from tkinter import messagebox, ttk
 APP_NAME = "Pixiv 自動貼圖"
 POLL_INTERVAL_SECONDS = 30
 MAX_SEEN_IDS = 100
-BLACKLISTED_AUTHORS = {"Summer 菊島夏日"}
 
 
 def app_directory() -> Path:
@@ -44,6 +43,7 @@ class Settings:
     php_sessid: str = ""
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
+    excluded_authors: str = ""
 
     @classmethod
     def load(cls) -> "Settings":
@@ -61,6 +61,14 @@ class Settings:
         CONFIG_PATH.write_text(
             json.dumps(asdict(self), ensure_ascii=False, indent=2), encoding="utf-8"
         )
+
+    def excluded_author_set(self) -> set[str]:
+        """Return non-empty author names entered one per line."""
+        return {name.strip() for name in self.excluded_authors.splitlines() if name.strip()}
+
+    def keywords(self) -> list[str]:
+        """Return non-empty search keywords entered one per line."""
+        return list(dict.fromkeys(word.strip() for word in self.keyword.splitlines() if word.strip()))
 
 
 class PixivWorker:
@@ -95,41 +103,50 @@ class PixivWorker:
     def check_once(self) -> None:
         if self.stop_event.is_set():
             return
-        keyword = self.settings.keyword.strip()
-        url = "https://www.pixiv.net/ajax/search/artworks/{}?word={}&mode=tag&order=date_d&p=1".format(
-            quote(keyword), quote(keyword)
-        )
-        self.log(f"正在查詢關鍵字「{keyword}」…")
-        response = self.session.get(url, timeout=15)
-        response.raise_for_status()
-        works = response.json()["body"]["illustManga"]["data"]
-        self.log(f"找到 {len(works)} 個作品。")
         seen = self.load_seen()
-        new_works = [work for work in works[:10] if str(work["id"]) not in seen]
-        if not new_works:
-            self.log("沒有新作品。")
-            return
-
-        self.log(f"偵測到 {len(new_works)} 個新作品。")
-        for work in reversed(new_works):
+        found_new_work = False
+        excluded_authors = self.settings.excluded_author_set()
+        for keyword in self.settings.keywords():
             if self.stop_event.is_set():
                 return
-            work_id, title, author = str(work["id"]), work["title"], work["userName"]
-            work_url = f"https://www.pixiv.net/artworks/{work_id}"
-            self.notify(f"【Pixiv 新作品】\n\n關鍵字: {keyword}\n標題: {title}\n作者: {author}\n\n{work_url}")
-            if author in BLACKLISTED_AUTHORS:
-                self.log(f"略過黑名單作者的作品：{title}")
-                seen.add(work_id)
+            url = "https://www.pixiv.net/ajax/search/artworks/{}?word={}&mode=tag&order=date_d&p=1".format(
+                quote(keyword), quote(keyword)
+            )
+            self.log(f"正在查詢關鍵字「{keyword}」…")
+            response = self.session.get(url, timeout=15)
+            response.raise_for_status()
+            works = response.json()["body"]["illustManga"]["data"]
+            self.log(f"「{keyword}」找到 {len(works)} 個作品。")
+            new_works = [work for work in works[:10] if str(work["id"]) not in seen]
+            if not new_works:
                 continue
-            self.log(f"正在對作品貼圖：{title}")
-            if self.click_stamp(work_id):
-                seen.add(work_id)
-                self.notify(f"✅ 已點擊貼圖\n\n作品: {title}")
-                self.log("貼圖完成。")
-            else:
-                self.notify(f"❌ 點擊貼圖失敗\n\n作品: {title}")
-                self.log("貼圖失敗，保留此作品供下次重試。")
+
+            found_new_work = True
+            self.log(f"「{keyword}」偵測到 {len(new_works)} 個新作品。")
+            for work in reversed(new_works):
+                if self.stop_event.is_set():
+                    return
+                work_id, title, author = str(work["id"]), work["title"], work["userName"]
+                work_url = f"https://www.pixiv.net/artworks/{work_id}"
+                self.notify(f"【Pixiv 新作品】\n\n關鍵字: {keyword}\n標題: {title}\n作者: {author}\n\n{work_url}")
+                if author in excluded_authors:
+                    self.log(f"略過排除作者的作品：{title}（{author}）")
+                    seen.add(work_id)
+                    continue
+                self.log(f"正在對作品貼圖：{title}")
+                if self.click_stamp(work_id):
+                    seen.add(work_id)
+                    self.notify(f"✅ 已點擊貼圖\n\n作品: {title}")
+                    self.log("貼圖完成。")
+                else:
+                    self.notify(f"❌ 點擊貼圖失敗\n\n作品: {title}")
+                    self.log("貼圖失敗，保留此作品供下次重試。")
+        if not found_new_work:
+            self.log("所有關鍵字均沒有新作品。")
         self.save_seen(seen)
+        # Chrome is created lazily only when a stamp must be clicked. Close it
+        # once this polling round has handled every new work.
+        self.close_driver()
 
     def notify(self, text: str) -> None:
         if not self.settings.telegram_bot_token or not self.settings.telegram_chat_id:
@@ -251,7 +268,7 @@ class Application(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("760x590")
+        self.geometry("760x650")
         self.minsize(640, 480)
         self.log_queue: queue.Queue[str] = queue.Queue()
         self.worker_thread: threading.Thread | None = None
@@ -268,13 +285,23 @@ class Application(tk.Tk):
         settings_frame = ttk.LabelFrame(root, text="設定（儲存於 exe 同資料夾的 config.json）", padding=10)
         settings_frame.pack(fill="x")
         self.entries: dict[str, ttk.Entry] = {}
-        fields = [("keyword", "關鍵字", False), ("php_sessid", "Pixiv PHPSESSID", True), ("telegram_bot_token", "Telegram Bot Token", True), ("telegram_chat_id", "Telegram Chat ID", False)]
+        fields = [("php_sessid", "Pixiv PHPSESSID", True), ("telegram_bot_token", "Telegram Bot Token", True), ("telegram_chat_id", "Telegram Chat ID", False)]
         for row, (key, label, masked) in enumerate(fields):
             ttk.Label(settings_frame, text=label, width=20).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=3)
             entry = ttk.Entry(settings_frame, show="•" if masked else "")
             entry.insert(0, getattr(self.settings, key))
             entry.grid(row=row, column=1, sticky="ew", pady=3)
             self.entries[key] = entry
+        ttk.Label(settings_frame, text="關鍵字", width=20).grid(row=len(fields), column=0, sticky="nw", padx=(0, 8), pady=3)
+        self.keywords_text = tk.Text(settings_frame, height=3, wrap="word", font=("Microsoft JhengHei UI", 10))
+        self.keywords_text.insert("1.0", self.settings.keyword)
+        self.keywords_text.grid(row=len(fields), column=1, sticky="ew", pady=3)
+        ttk.Label(settings_frame, text="每行填寫一個關鍵字；程式會依序搜尋。 ").grid(row=len(fields) + 1, column=1, sticky="w")
+        ttk.Label(settings_frame, text="排除作者", width=20).grid(row=len(fields) + 2, column=0, sticky="nw", padx=(0, 8), pady=3)
+        self.excluded_authors_text = tk.Text(settings_frame, height=3, wrap="word", font=("Microsoft JhengHei UI", 10))
+        self.excluded_authors_text.insert("1.0", self.settings.excluded_authors)
+        self.excluded_authors_text.grid(row=len(fields) + 2, column=1, sticky="ew", pady=3)
+        ttk.Label(settings_frame, text="每行填寫一位作者；符合者只通知，不會貼圖。").grid(row=len(fields) + 3, column=1, sticky="w")
         settings_frame.columnconfigure(1, weight=1)
         controls = ttk.Frame(root)
         controls.pack(fill="x", pady=12)
@@ -282,6 +309,8 @@ class Application(tk.Tk):
         self.start_button.pack(side="left")
         self.stop_button = ttk.Button(controls, text="停止", command=self.stop, state="disabled")
         self.stop_button.pack(side="left", padx=8)
+        self.save_button = ttk.Button(controls, text="儲存設定", command=self.save_settings)
+        self.save_button.pack(side="left")
         self.status = tk.StringVar(value="狀態：未啟動")
         ttk.Label(controls, textvariable=self.status).pack(side="right")
         ttk.Label(root, text="執行日誌").pack(anchor="w")
@@ -290,6 +319,8 @@ class Application(tk.Tk):
 
     def start(self) -> None:
         values = {key: entry.get().strip() for key, entry in self.entries.items()}
+        values["keyword"] = self.keywords_text.get("1.0", "end-1c")
+        values["excluded_authors"] = self.excluded_authors_text.get("1.0", "end-1c")
         if not values["keyword"] or not values["php_sessid"]:
             messagebox.showwarning(APP_NAME, "請先填寫關鍵字與 Pixiv PHPSESSID。")
             return
@@ -302,6 +333,14 @@ class Application(tk.Tk):
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
         self.status.set("狀態：執行中")
+        self.enqueue_log("設定已儲存。")
+
+    def save_settings(self) -> None:
+        values = {key: entry.get().strip() for key, entry in self.entries.items()}
+        values["keyword"] = self.keywords_text.get("1.0", "end-1c")
+        values["excluded_authors"] = self.excluded_authors_text.get("1.0", "end-1c")
+        self.settings = Settings(**values)
+        self.settings.save()
         self.enqueue_log("設定已儲存。")
 
     def stop(self) -> None:
