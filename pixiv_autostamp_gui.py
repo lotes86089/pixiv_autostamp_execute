@@ -220,30 +220,35 @@ class PixivWorker:
             self.driver.get(f"https://www.pixiv.net/artworks/{work_id}")
             if self.stop_event.wait(3):
                 return False
-            wait = WebDriverWait(self.driver, 10)
+            wait = WebDriverWait(self.driver, 1)
             steps = [
-                # Pixiv's surrounding classes change often; keep the supplied
-                # full selector and XPath as mutually exclusive fallbacks.
                 [
-                    (By.CSS_SELECTOR, "#__next > div > div:nth-child(2) > div.sc-6eb1bc88-0.gohsiI.__top_side_menu_body > div.sc-8d5ac044-0.cHpDVl > div > div.sc-4a56e1b9-3.jcstOR > main > section > div.sc-455f28d6-0.kNvAwq > div:nth-child(2) > section > div > div > div.CommentInput_container__8MItU > form > div > nav > div"),
                     (By.XPATH, "/html/body/div[1]/div/div[2]/div[5]/div[1]/div/div[1]/main/section/div[2]/div[2]/section/div/div/div[1]/form/div/nav/div"),
                 ],
-                [(By.XPATH, "/html/body/div[5]/div/div/div/nav/button[2]")],
-                [(By.XPATH, "/html/body/div[5]/div/div/div/div/div/div/div[3]/button")],
+                [
+                    (By.XPATH, "/html/body/div[6]/div/div/div/nav/button[2]"),
+                    (By.XPATH, "/html/body/div[5]/div/div/div/nav/button[2]"),
+                ],
+                [
+                    (By.XPATH, "/html/body/div[6]/div/div/div/div/div/div/div[3]/button"),
+                    (By.XPATH, "/html/body/div[5]/div/div/div/div/div/div/div[3]/button"),
+                ],
             ]
             for index, candidates in enumerate(steps, start=1):
                 if self.stop_event.is_set():
                     return False
                 last_error = None
+                clicked = False
                 for by, selector in candidates:
                     try:
                         element = wait.until(EC.element_to_be_clickable((by, selector)))
                         self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
                         element.click()
+                        clicked = True
                         break
                     except Exception as exc:
                         last_error = exc
-                else:
+                if not clicked:
                     raise last_error or RuntimeError(f"找不到貼圖步驟 {index} 的按鈕")
                 self.log(f"已完成貼圖步驟 {index}/3。")
                 if self.stop_event.wait(1):
