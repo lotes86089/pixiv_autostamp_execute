@@ -26,6 +26,8 @@ from tkinter import messagebox, ttk
 APP_NAME = "Pixiv 自動貼圖"
 POLL_INTERVAL_SECONDS = 30
 MAX_SEEN_IDS = 100
+AUTOSTART_REGISTRY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+AUTOSTART_VALUE_NAME = "PixivAutoStamp"
 
 
 def app_directory() -> Path:
@@ -44,6 +46,7 @@ class Settings:
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     excluded_authors: str = ""
+    auto_start_on_login: bool = False
 
     @classmethod
     def load(cls) -> "Settings":
@@ -69,6 +72,25 @@ class Settings:
     def keywords(self) -> list[str]:
         """Return non-empty search keywords entered one per line."""
         return list(dict.fromkeys(word.strip() for word in self.keyword.splitlines() if word.strip()))
+
+
+def configure_autostart(enabled: bool) -> None:
+    """Add or remove this application from the current user's login startup."""
+    if getattr(sys, "frozen", False):
+        command = f'"{Path(sys.executable).resolve()}"'
+    else:
+        command = f'"{Path(sys.executable).resolve()}" "{Path(__file__).resolve()}"'
+
+    with winreg.OpenKey(
+        winreg.HKEY_CURRENT_USER, AUTOSTART_REGISTRY_PATH, 0, winreg.KEY_SET_VALUE
+    ) as key:
+        if enabled:
+            winreg.SetValueEx(key, AUTOSTART_VALUE_NAME, 0, winreg.REG_SZ, command)
+        else:
+            try:
+                winreg.DeleteValue(key, AUTOSTART_VALUE_NAME)
+            except FileNotFoundError:
+                pass
 
 
 class PixivWorker:
@@ -131,11 +153,11 @@ class PixivWorker:
                 self.notify(f"【Pixiv 新作品】\n\n關鍵字: {keyword}\n標題: {title}\n作者: {author}\n\n{work_url}")
                 if author in excluded_authors:
                     self.log(f"略過排除作者的作品：{title}（{author}）")
-                    seen.add(work_id)
+                    seen[work_id] = None
                     continue
                 self.log(f"正在對作品貼圖：{title}")
                 if self.click_stamp(work_id):
-                    seen.add(work_id)
+                    seen[work_id] = None
                     self.notify(f"✅ 已點擊貼圖\n\n作品: {title}")
                     self.log("貼圖完成。")
                 else:
@@ -162,13 +184,17 @@ class PixivWorker:
         except requests.RequestException as exc:
             self.log(f"Telegram 通知失敗：{exc}")
 
-    def load_seen(self) -> set[str]:
+    def load_seen(self) -> dict[str, None]:
         try:
-            return set(json.loads(STATE_PATH.read_text(encoding="utf-8")))
+            # A dict preserves JSON order while retaining fast membership
+            # checks. The newest IDs are appended at the end.
+            return dict.fromkeys(str(work_id) for work_id in json.loads(STATE_PATH.read_text(encoding="utf-8")))
         except (OSError, json.JSONDecodeError):
-            return set()
+            return {}
 
-    def save_seen(self, seen: set[str]) -> None:
+    def save_seen(self, seen: dict[str, None]) -> None:
+        # Keep the most recently added IDs. Unlike a set, this never drops a
+        # newly processed work merely because the collection reached its cap.
         STATE_PATH.write_text(json.dumps(list(seen)[-MAX_SEEN_IDS:]), encoding="utf-8")
 
     def init_driver(self) -> None:
@@ -282,6 +308,8 @@ class Application(tk.Tk):
         self.settings = Settings.load()
         self.build_ui()
         self.after(150, self.flush_logs)
+        if self.settings.auto_start_on_login:
+            self.after(500, self.start)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def build_ui(self) -> None:
@@ -290,23 +318,29 @@ class Application(tk.Tk):
         settings_frame = ttk.LabelFrame(root, text="設定（儲存於 exe 同資料夾的 config.json）", padding=10)
         settings_frame.pack(fill="x")
         self.entries: dict[str, ttk.Entry] = {}
+        self.auto_start_on_login = tk.BooleanVar(value=self.settings.auto_start_on_login)
+        ttk.Checkbutton(
+            settings_frame,
+            text="開機後自動啟動監控",
+            variable=self.auto_start_on_login,
+        ).grid(row=0, column=1, sticky="w", pady=(0, 5))
         fields = [("php_sessid", "Pixiv PHPSESSID", True), ("telegram_bot_token", "Telegram Bot Token", True), ("telegram_chat_id", "Telegram Chat ID", False)]
-        for row, (key, label, masked) in enumerate(fields):
+        for row, (key, label, masked) in enumerate(fields, start=1):
             ttk.Label(settings_frame, text=label, width=20).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=3)
             entry = ttk.Entry(settings_frame, show="•" if masked else "")
             entry.insert(0, getattr(self.settings, key))
             entry.grid(row=row, column=1, sticky="ew", pady=3)
             self.entries[key] = entry
-        ttk.Label(settings_frame, text="關鍵字", width=20).grid(row=len(fields), column=0, sticky="nw", padx=(0, 8), pady=3)
+        ttk.Label(settings_frame, text="關鍵字", width=20).grid(row=len(fields) + 1, column=0, sticky="nw", padx=(0, 8), pady=3)
         self.keywords_text = tk.Text(settings_frame, height=3, wrap="word", font=("Microsoft JhengHei UI", 10))
         self.keywords_text.insert("1.0", self.settings.keyword)
-        self.keywords_text.grid(row=len(fields), column=1, sticky="ew", pady=3)
-        ttk.Label(settings_frame, text="每行填寫一個關鍵字；程式會依序搜尋。 ").grid(row=len(fields) + 1, column=1, sticky="w")
-        ttk.Label(settings_frame, text="排除作者", width=20).grid(row=len(fields) + 2, column=0, sticky="nw", padx=(0, 8), pady=3)
+        self.keywords_text.grid(row=len(fields) + 1, column=1, sticky="ew", pady=3)
+        ttk.Label(settings_frame, text="每行填寫一個關鍵字；程式會依序搜尋。 ").grid(row=len(fields) + 2, column=1, sticky="w")
+        ttk.Label(settings_frame, text="排除作者", width=20).grid(row=len(fields) + 3, column=0, sticky="nw", padx=(0, 8), pady=3)
         self.excluded_authors_text = tk.Text(settings_frame, height=3, wrap="word", font=("Microsoft JhengHei UI", 10))
         self.excluded_authors_text.insert("1.0", self.settings.excluded_authors)
-        self.excluded_authors_text.grid(row=len(fields) + 2, column=1, sticky="ew", pady=3)
-        ttk.Label(settings_frame, text="每行填寫一位作者；符合者只通知，不會貼圖。").grid(row=len(fields) + 3, column=1, sticky="w")
+        self.excluded_authors_text.grid(row=len(fields) + 3, column=1, sticky="ew", pady=3)
+        ttk.Label(settings_frame, text="每行填寫一位作者；符合者只通知，不會貼圖。").grid(row=len(fields) + 4, column=1, sticky="w")
         settings_frame.columnconfigure(1, weight=1)
         controls = ttk.Frame(root)
         controls.pack(fill="x", pady=12)
@@ -323,14 +357,12 @@ class Application(tk.Tk):
         self.log_text.pack(fill="both", expand=True, pady=(4, 0))
 
     def start(self) -> None:
-        values = {key: entry.get().strip() for key, entry in self.entries.items()}
-        values["keyword"] = self.keywords_text.get("1.0", "end-1c")
-        values["excluded_authors"] = self.excluded_authors_text.get("1.0", "end-1c")
-        if not values["keyword"] or not values["php_sessid"]:
+        settings = self.collect_settings()
+        if not settings.keyword.strip() or not settings.php_sessid:
             messagebox.showwarning(APP_NAME, "請先填寫關鍵字與 Pixiv PHPSESSID。")
             return
-        self.settings = Settings(**values)
-        self.settings.save()
+        if not self.persist_settings(settings):
+            return
         self.stop_event = threading.Event()
         worker = PixivWorker(self.settings, self.enqueue_log, self.stop_event)
         self.worker_thread = threading.Thread(target=worker.run, daemon=True)
@@ -341,12 +373,25 @@ class Application(tk.Tk):
         self.enqueue_log("設定已儲存。")
 
     def save_settings(self) -> None:
+        self.persist_settings(self.collect_settings())
+
+    def collect_settings(self) -> Settings:
         values = {key: entry.get().strip() for key, entry in self.entries.items()}
         values["keyword"] = self.keywords_text.get("1.0", "end-1c")
         values["excluded_authors"] = self.excluded_authors_text.get("1.0", "end-1c")
-        self.settings = Settings(**values)
+        values["auto_start_on_login"] = self.auto_start_on_login.get()
+        return Settings(**values)
+
+    def persist_settings(self, settings: Settings) -> bool:
+        try:
+            configure_autostart(settings.auto_start_on_login)
+        except OSError as exc:
+            messagebox.showerror(APP_NAME, f"無法更新開機自動執行設定：{exc}")
+            return False
+        self.settings = settings
         self.settings.save()
         self.enqueue_log("設定已儲存。")
+        return True
 
     def stop(self) -> None:
         if self.stop_event is not None:
