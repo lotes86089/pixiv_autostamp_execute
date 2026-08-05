@@ -151,6 +151,10 @@ class PixivWorker:
                 work_id, title, author = str(work["id"]), work["title"], work["userName"]
                 work_url = f"https://www.pixiv.net/artworks/{work_id}"
                 self.notify(f"【Pixiv 新作品】\n\n關鍵字: {keyword}\n標題: {title}\n作者: {author}\n\n{work_url}")
+                if self.comments_disabled(work_id):
+                    self.log(f"略過已關閉留言的作品：{title}")
+                    seen[work_id] = None
+                    continue
                 if author in excluded_authors:
                     self.log(f"略過排除作者的作品：{title}（{author}）")
                     seen[work_id] = None
@@ -169,6 +173,18 @@ class PixivWorker:
         # Chrome is created lazily only when a stamp must be clicked. Close it
         # once this polling round has handled every new work.
         self.close_driver()
+
+    def comments_disabled(self, work_id: str) -> bool:
+        """Return whether Pixiv has disabled comments/stamps for this work."""
+        try:
+            response = self.session.get(
+                f"https://www.pixiv.net/ajax/illust/{work_id}", timeout=15
+            )
+            response.raise_for_status()
+            return bool(response.json().get("body", {}).get("commentOff"))
+        except (requests.RequestException, ValueError) as exc:
+            self.log(f"無法確認留言設定，將照常嘗試貼圖：{exc}")
+            return False
 
     def notify(self, text: str) -> None:
         if not self.settings.telegram_bot_token or not self.settings.telegram_chat_id:
