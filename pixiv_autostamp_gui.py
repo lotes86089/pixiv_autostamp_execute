@@ -6,6 +6,7 @@ credentials are not embedded in the distributable program.
 
 from __future__ import annotations
 
+import ctypes
 import json
 import queue
 import sys
@@ -14,20 +15,27 @@ import time
 import traceback
 import winreg
 from dataclasses import dataclass, asdict
+from ctypes import wintypes
 from pathlib import Path
 from typing import Callable
 from urllib.parse import quote
 
 import requests
 import tkinter as tk
+import pystray
+from PIL import Image, ImageTk
 from tkinter import messagebox, ttk
 
 
 APP_NAME = "Pixiv 自動貼圖"
 POLL_INTERVAL_SECONDS = 30
-MAX_SEEN_IDS = 100
+MAX_SEEN_IDS = 300
 AUTOSTART_REGISTRY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 AUTOSTART_VALUE_NAME = "PixivAutoStamp"
+SINGLE_INSTANCE_MUTEX_NAME = r"Local\PixivAutoStampExecute"
+ERROR_ALREADY_EXISTS = 183
+SW_RESTORE = 9
+_single_instance_mutex = None
 
 
 def app_directory() -> Path:
@@ -35,8 +43,53 @@ def app_directory() -> Path:
     return Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
 
 
+def resource_path(filename: str) -> Path:
+    """Return a bundled resource path when running from a PyInstaller exe."""
+    base_directory = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base_directory / filename
+
+
+def show_existing_window() -> None:
+    """Restore a running instance, including one hidden in the system tray."""
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.FindWindowW.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR)
+    user32.FindWindowW.restype = wintypes.HWND
+    user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
+    user32.ShowWindow.restype = wintypes.BOOL
+    user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
+    user32.SetForegroundWindow.restype = wintypes.BOOL
+    for _ in range(10):
+        window_handle = user32.FindWindowW(None, APP_NAME)
+        if window_handle:
+            user32.ShowWindow(window_handle, SW_RESTORE)
+            user32.SetForegroundWindow(window_handle)
+            return
+        time.sleep(0.1)
+
+
+def acquire_single_instance() -> bool:
+    """Return False when another instance is already running."""
+    global _single_instance_mutex
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = (wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR)
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    mutex_handle = kernel32.CreateMutexW(None, False, SINGLE_INSTANCE_MUTEX_NAME)
+    if not mutex_handle:
+        # Do not block the app if the mutex API is unexpectedly unavailable.
+        return True
+    if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+        show_existing_window()
+        kernel32.CloseHandle(mutex_handle)
+        return False
+    _single_instance_mutex = mutex_handle
+    return True
+
+
 CONFIG_PATH = app_directory() / "config.json"
 STATE_PATH = app_directory() / "seen_id.json"
+APP_ICON_PATH = resource_path("pixiv_autostamp_icon.png")
 
 
 @dataclass
@@ -45,6 +98,7 @@ class Settings:
     php_sessid: str = ""
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
+    notes: str = ""
     excluded_authors: str = ""
     auto_start_on_login: bool = False
 
@@ -115,6 +169,16 @@ class PixivWorker:
                 self.check_once()
                 if self.stop_event.wait(POLL_INTERVAL_SECONDS):
                     break
+        except requests.HTTPError as exc:
+            status_code = exc.response.status_code if exc.response is not None else None
+            if status_code == 401:
+                self.log(
+                    "Pixiv 驗證失敗（401）：PHPSESSID 已失效或不正確。"
+                    "請重新從已登入 Pixiv 的瀏覽器取得 PHPSESSID，貼到設定欄位後按「儲存設定」，再重新啟動服務。"
+                )
+            else:
+                self.log(f"Pixiv 網路請求失敗（HTTP {status_code or '未知'}）：{exc}")
+                self.log(traceback.format_exc())
         except Exception as exc:
             self.log(f"執行發生未預期錯誤：{exc}")
             self.log(traceback.format_exc())
@@ -315,18 +379,47 @@ class Application(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_NAME)
+        self.window_icon_image = ImageTk.PhotoImage(Image.open(APP_ICON_PATH).convert("RGBA"))
+        self.iconphoto(True, self.window_icon_image)
         self.geometry("760x650")
         self.minsize(640, 480)
         self.log_queue: queue.Queue[str] = queue.Queue()
         self.worker_thread: threading.Thread | None = None
         self.stop_event: threading.Event | None = None
         self.closing = False
+        self.tray_icon = self.create_tray_icon()
         self.settings = Settings.load()
         self.build_ui()
+        self.tray_icon.run_detached()
         self.after(150, self.flush_logs)
         if self.settings.auto_start_on_login:
             self.after(500, self.start)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def create_tray_icon(self) -> pystray.Icon:
+        """Create the notification-area menu used while the window is hidden."""
+        image = Image.open(APP_ICON_PATH).convert("RGBA")
+        menu = pystray.Menu(
+            pystray.MenuItem("顯示視窗", self.show_window, default=True),
+            pystray.MenuItem("結束程式", self.exit_application),
+        )
+        return pystray.Icon("pixiv_autostamp", image, APP_NAME, menu)
+
+    def hide_to_tray(self) -> None:
+        self.withdraw()
+        self.enqueue_log("視窗已隱藏至系統匣；服務會繼續在背景執行。")
+
+    def show_window(self, icon: pystray.Icon | None = None, item: pystray.MenuItem | None = None) -> None:
+        self.after(0, self._show_window)
+
+    def _show_window(self) -> None:
+        self.deiconify()
+        self.state("normal")
+        self.lift()
+        self.focus_force()
+
+    def exit_application(self, icon: pystray.Icon | None = None, item: pystray.MenuItem | None = None) -> None:
+        self.after(0, self.shutdown)
 
     def build_ui(self) -> None:
         root = ttk.Frame(self, padding=16)
@@ -341,22 +434,33 @@ class Application(tk.Tk):
             variable=self.auto_start_on_login,
         ).grid(row=0, column=1, sticky="w", pady=(0, 5))
         fields = [("php_sessid", "Pixiv PHPSESSID", True), ("telegram_bot_token", "Telegram Bot Token", True), ("telegram_chat_id", "Telegram Chat ID", False)]
-        for row, (key, label, masked) in enumerate(fields, start=1):
+        row = 1
+        for key, label, masked in fields:
             ttk.Label(settings_frame, text=label, width=20).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=3)
             entry = ttk.Entry(settings_frame, show="•" if masked else "")
             entry.insert(0, getattr(self.settings, key))
             entry.grid(row=row, column=1, sticky="ew", pady=3)
             self.entries[key] = entry
-        ttk.Label(settings_frame, text="關鍵字", width=20).grid(row=len(fields) + 1, column=0, sticky="nw", padx=(0, 8), pady=3)
+            row += 1
+            if key == "php_sessid":
+                ttk.Label(settings_frame, text="備註", width=20).grid(row=row, column=0, sticky="nw", padx=(0, 8), pady=3)
+                self.notes_text = tk.Text(settings_frame, height=2, wrap="word", font=("Microsoft JhengHei UI", 10))
+                self.notes_text.insert("1.0", self.settings.notes)
+                self.notes_text.grid(row=row, column=1, sticky="ew", pady=3)
+                row += 1
+        ttk.Label(settings_frame, text="關鍵字", width=20).grid(row=row, column=0, sticky="nw", padx=(0, 8), pady=3)
         self.keywords_text = tk.Text(settings_frame, height=3, wrap="word", font=("Microsoft JhengHei UI", 10))
         self.keywords_text.insert("1.0", self.settings.keyword)
-        self.keywords_text.grid(row=len(fields) + 1, column=1, sticky="ew", pady=3)
-        ttk.Label(settings_frame, text="每行填寫一個關鍵字；程式會依序搜尋。 ").grid(row=len(fields) + 2, column=1, sticky="w")
-        ttk.Label(settings_frame, text="排除作者", width=20).grid(row=len(fields) + 3, column=0, sticky="nw", padx=(0, 8), pady=3)
+        self.keywords_text.grid(row=row, column=1, sticky="ew", pady=3)
+        row += 1
+        ttk.Label(settings_frame, text="每行填寫一個關鍵字；程式會依序搜尋。 ").grid(row=row, column=1, sticky="w")
+        row += 1
+        ttk.Label(settings_frame, text="排除作者", width=20).grid(row=row, column=0, sticky="nw", padx=(0, 8), pady=3)
         self.excluded_authors_text = tk.Text(settings_frame, height=3, wrap="word", font=("Microsoft JhengHei UI", 10))
         self.excluded_authors_text.insert("1.0", self.settings.excluded_authors)
-        self.excluded_authors_text.grid(row=len(fields) + 3, column=1, sticky="ew", pady=3)
-        ttk.Label(settings_frame, text="每行填寫一位作者；符合者只通知，不會貼圖。").grid(row=len(fields) + 4, column=1, sticky="w")
+        self.excluded_authors_text.grid(row=row, column=1, sticky="ew", pady=3)
+        row += 1
+        ttk.Label(settings_frame, text="每行填寫一位作者；符合者只通知，不會貼圖。").grid(row=row, column=1, sticky="w")
         settings_frame.columnconfigure(1, weight=1)
         controls = ttk.Frame(root)
         controls.pack(fill="x", pady=12)
@@ -393,6 +497,7 @@ class Application(tk.Tk):
 
     def collect_settings(self) -> Settings:
         values = {key: entry.get().strip() for key, entry in self.entries.items()}
+        values["notes"] = self.notes_text.get("1.0", "end-1c")
         values["keyword"] = self.keywords_text.get("1.0", "end-1c")
         values["excluded_authors"] = self.excluded_authors_text.get("1.0", "end-1c")
         values["auto_start_on_login"] = self.auto_start_on_login.get()
@@ -438,16 +543,28 @@ class Application(tk.Tk):
         self.after(150, self.flush_logs)
 
     def on_close(self) -> None:
+        self.hide_to_tray()
+
+    def shutdown(self) -> None:
+        """Stop the service and close the app after the tray Exit command."""
+        if self.closing:
+            return
+        self.closing = True
         if self.worker_thread is not None and self.worker_thread.is_alive():
-            if not self.closing and not messagebox.askyesno(APP_NAME, "服務仍在執行，確定要停止並關閉嗎？"):
-                return
-            self.closing = True
             if self.stop_event is not None:
                 self.stop_event.set()
-            self.after(250, self.on_close)
+            self.after(250, self.finish_shutdown)
             return
+        self.finish_shutdown()
+
+    def finish_shutdown(self) -> None:
+        if self.worker_thread is not None and self.worker_thread.is_alive():
+            self.after(250, self.finish_shutdown)
+            return
+        self.tray_icon.stop()
         self.destroy()
 
 
 if __name__ == "__main__":
-    Application().mainloop()
+    if acquire_single_instance():
+        Application().mainloop()
