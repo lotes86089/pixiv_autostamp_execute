@@ -9,10 +9,13 @@ from __future__ import annotations
 import ctypes
 import json
 import queue
+import shutil
+import subprocess
 import sys
 import threading
 import time
 import traceback
+import webbrowser
 import winreg
 from dataclasses import dataclass, asdict
 from ctypes import wintypes
@@ -29,7 +32,7 @@ from tkinter import messagebox, ttk
 
 APP_NAME = "Pixiv 自動貼圖"
 POLL_INTERVAL_SECONDS = 30
-MAX_SEEN_IDS = 300
+MAX_SEEN_IDS = 500
 AUTOSTART_REGISTRY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 AUTOSTART_VALUE_NAME = "PixivAutoStamp"
 SINGLE_INSTANCE_MUTEX_NAME = r"Local\PixivAutoStampExecute"
@@ -90,6 +93,88 @@ def acquire_single_instance() -> bool:
 CONFIG_PATH = app_directory() / "config.json"
 STATE_PATH = app_directory() / "seen_id.json"
 APP_ICON_PATH = resource_path("pixiv_autostamp_icon.png")
+PIXIV_HOME_URL = "https://www.pixiv.net/"
+
+
+def search_api_url(keyword: str) -> str:
+    """Build the exact Pixiv search API URL used by the worker."""
+    encoded_keyword = quote(keyword)
+    return (
+        f"https://www.pixiv.net/ajax/search/artworks/{encoded_keyword}"
+        f"?word={encoded_keyword}&mode=tag&order=date_d&p=1"
+    )
+
+
+def create_pixiv_session(php_sessid: str) -> requests.Session:
+    """Create an authenticated session for Pixiv's JSON API."""
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://www.pixiv.net/",
+        "Accept": "application/json",
+        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+    })
+    session.cookies.update({"PHPSESSID": php_sessid})
+    return session
+
+
+def load_seen_ids() -> dict[str, None]:
+    try:
+        # A dict preserves JSON order while retaining fast membership checks.
+        return dict.fromkeys(str(work_id) for work_id in json.loads(STATE_PATH.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_seen_ids(seen: dict[str, None]) -> None:
+    """Keep only the most recently added IDs in processing order."""
+    STATE_PATH.write_text(json.dumps(list(seen)[-MAX_SEEN_IDS:]), encoding="utf-8")
+
+
+def firefox_executable() -> Path | None:
+    """Find Firefox in PATH or either standard Windows installation folder."""
+    found = shutil.which("firefox.exe")
+    candidates = [
+        Path(found) if found else None,
+        Path(r"C:\Program Files\Mozilla Firefox\firefox.exe"),
+        Path(r"C:\Program Files (x86)\Mozilla Firefox\firefox.exe"),
+    ]
+    return next((path for path in candidates if path is not None and path.is_file()), None)
+
+
+class Tooltip:
+    """A small hover hint for Tk widgets."""
+
+    def __init__(self, widget: tk.Widget, text: str) -> None:
+        self.widget = widget
+        self.text = text
+        self.window: tk.Toplevel | None = None
+        widget.bind("<Enter>", self.show, add="+")
+        widget.bind("<Leave>", self.hide, add="+")
+        widget.bind("<ButtonPress>", self.hide, add="+")
+
+    def show(self, _event: tk.Event | None = None) -> None:
+        if self.window is not None:
+            return
+        self.window = tk.Toplevel(self.widget)
+        self.window.wm_overrideredirect(True)
+        self.window.wm_geometry(
+            f"+{self.widget.winfo_rootx() + 20}+{self.widget.winfo_rooty() + self.widget.winfo_height() + 4}"
+        )
+        tk.Label(
+            self.window,
+            text=self.text,
+            padx=8,
+            pady=5,
+            relief="solid",
+            borderwidth=1,
+            background="#ffffe0",
+        ).pack()
+
+    def hide(self, _event: tk.Event | None = None) -> None:
+        if self.window is not None:
+            self.window.destroy()
+            self.window = None
 
 
 @dataclass
@@ -153,14 +238,7 @@ class PixivWorker:
         self.log = log
         self.stop_event = stop_event
         self.driver = None
-        self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": "Mozilla/5.0",
-            "Referer": "https://www.pixiv.net/",
-            "Accept": "application/json",
-            "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
-        })
-        self.session.cookies.update({"PHPSESSID": settings.php_sessid})
+        self.session = create_pixiv_session(settings.php_sessid)
 
     def run(self) -> None:
         self.log("服務已啟動，將每 30 秒檢查一次新作品。")
@@ -195,15 +273,13 @@ class PixivWorker:
         for keyword in self.settings.keywords():
             if self.stop_event.is_set():
                 return
-            url = "https://www.pixiv.net/ajax/search/artworks/{}?word={}&mode=tag&order=date_d&p=1".format(
-                quote(keyword), quote(keyword)
-            )
+            url = search_api_url(keyword)
             self.log(f"正在查詢關鍵字「{keyword}」…")
             response = self.session.get(url, timeout=15)
             response.raise_for_status()
             works = response.json()["body"]["illustManga"]["data"]
             self.log(f"「{keyword}」找到 {len(works)} 個作品。")
-            new_works = [work for work in works[:10] if str(work["id"]) not in seen]
+            new_works = [work for work in works if str(work["id"]) not in seen]
             if not new_works:
                 continue
 
@@ -265,17 +341,10 @@ class PixivWorker:
             self.log(f"Telegram 通知失敗：{exc}")
 
     def load_seen(self) -> dict[str, None]:
-        try:
-            # A dict preserves JSON order while retaining fast membership
-            # checks. The newest IDs are appended at the end.
-            return dict.fromkeys(str(work_id) for work_id in json.loads(STATE_PATH.read_text(encoding="utf-8")))
-        except (OSError, json.JSONDecodeError):
-            return {}
+        return load_seen_ids()
 
     def save_seen(self, seen: dict[str, None]) -> None:
-        # Keep the most recently added IDs. Unlike a set, this never drops a
-        # newly processed work merely because the collection reached its cap.
-        STATE_PATH.write_text(json.dumps(list(seen)[-MAX_SEEN_IDS:]), encoding="utf-8")
+        save_seen_ids(seen)
 
     def init_driver(self) -> None:
         import undetected_chromedriver as uc
@@ -387,6 +456,7 @@ class Application(tk.Tk):
         self.worker_thread: threading.Thread | None = None
         self.stop_event: threading.Event | None = None
         self.closing = False
+        self.api_add_in_progress = False
         self.tray_icon = self.create_tray_icon()
         self.settings = Settings.load()
         self.build_ui()
@@ -443,12 +513,30 @@ class Application(tk.Tk):
             self.entries[key] = entry
             row += 1
             if key == "php_sessid":
-                ttk.Label(settings_frame, text="備註", width=20).grid(row=row, column=0, sticky="nw", padx=(0, 8), pady=3)
+                notes_label = ttk.Frame(settings_frame)
+                notes_label.grid(row=row, column=0, sticky="nw", padx=(0, 8), pady=3)
+                ttk.Label(notes_label, text="備註", width=8).pack(side="left")
+                ttk.Button(
+                    notes_label,
+                    text="Firefox 無痕開啟 Pixiv",
+                    command=self.open_pixiv_in_private_firefox,
+                ).pack(side="left")
                 self.notes_text = tk.Text(settings_frame, height=2, wrap="word", font=("Microsoft JhengHei UI", 10))
                 self.notes_text.insert("1.0", self.settings.notes)
                 self.notes_text.grid(row=row, column=1, sticky="ew", pady=3)
                 row += 1
-        ttk.Label(settings_frame, text="關鍵字", width=20).grid(row=row, column=0, sticky="nw", padx=(0, 8), pady=3)
+        keyword_label = ttk.Frame(settings_frame)
+        keyword_label.grid(row=row, column=0, sticky="nw", padx=(0, 8), pady=3)
+        ttk.Label(keyword_label, text="關鍵字", width=20).pack(anchor="w")
+        ttk.Button(keyword_label, text="查看 API 結果", command=self.open_keyword_api_results).pack(anchor="w")
+        self.add_api_results_button = ttk.Button(
+            keyword_label, text="添加API結果", command=self.add_api_results
+        )
+        self.add_api_results_button.pack(anchor="w", pady=(3, 0))
+        Tooltip(
+            self.add_api_results_button,
+            "停止狀態可用，添加新關鍵字後可點擊避免過多新作品",
+        )
         self.keywords_text = tk.Text(settings_frame, height=3, wrap="word", font=("Microsoft JhengHei UI", 10))
         self.keywords_text.insert("1.0", self.settings.keyword)
         self.keywords_text.grid(row=row, column=1, sticky="ew", pady=3)
@@ -477,6 +565,9 @@ class Application(tk.Tk):
         self.log_text.pack(fill="both", expand=True, pady=(4, 0))
 
     def start(self) -> None:
+        if self.api_add_in_progress:
+            messagebox.showinfo(APP_NAME, "正在加入 API 結果，完成後才能啟動服務。")
+            return
         settings = self.collect_settings()
         if not settings.keyword.strip() or not settings.php_sessid:
             messagebox.showwarning(APP_NAME, "請先填寫關鍵字與 Pixiv PHPSESSID。")
@@ -489,11 +580,89 @@ class Application(tk.Tk):
         self.worker_thread.start()
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
+        self.add_api_results_button.configure(state="disabled")
         self.status.set("狀態：執行中")
         self.enqueue_log("設定已儲存。")
 
     def save_settings(self) -> None:
         self.persist_settings(self.collect_settings())
+
+    def open_keyword_api_results(self) -> None:
+        keywords = Settings(keyword=self.keywords_text.get("1.0", "end-1c")).keywords()
+        if not keywords:
+            messagebox.showwarning(APP_NAME, "請先填寫至少一個關鍵字。")
+            return
+        for keyword in keywords:
+            webbrowser.open_new_tab(search_api_url(keyword))
+        self.enqueue_log(f"已開啟 {len(keywords)} 個關鍵字的 Pixiv API 搜尋結果。")
+
+    def open_pixiv_in_private_firefox(self) -> None:
+        executable = firefox_executable()
+        if executable is None:
+            messagebox.showerror(APP_NAME, "找不到 Firefox，請安裝 Firefox 後再試一次。")
+            return
+        try:
+            subprocess.Popen([str(executable), "-private-window", PIXIV_HOME_URL])
+            self.enqueue_log("已以 Firefox 無痕視窗開啟 Pixiv。")
+        except OSError as exc:
+            messagebox.showerror(APP_NAME, f"無法開啟 Firefox：{exc}")
+
+    def add_api_results(self) -> None:
+        """Record every work returned from page one without stamping it."""
+        if self.worker_thread is not None and self.worker_thread.is_alive():
+            messagebox.showwarning(APP_NAME, "服務執行中，請先停止服務再添加 API 結果。")
+            return
+        settings = self.collect_settings()
+        if not settings.keyword.strip() or not settings.php_sessid:
+            messagebox.showwarning(APP_NAME, "請先填寫關鍵字與 Pixiv PHPSESSID。")
+            return
+        self.api_add_in_progress = True
+        self.start_button.configure(state="disabled")
+        self.add_api_results_button.configure(state="disabled")
+        self.status.set("狀態：正在添加 API 結果…")
+        self.enqueue_log("正在讀取 API 第一頁全部作品並加入已處理記錄…")
+        threading.Thread(
+            target=self.add_api_results_worker, args=(settings,), daemon=True
+        ).start()
+
+    def add_api_results_worker(self, settings: Settings) -> None:
+        try:
+            session = create_pixiv_session(settings.php_sessid)
+            seen = load_seen_ids()
+            added_count = 0
+            result_count = 0
+            for keyword in settings.keywords():
+                response = session.get(search_api_url(keyword), timeout=15)
+                response.raise_for_status()
+                works = response.json()["body"]["illustManga"]["data"]
+                result_count += len(works)
+                for work in works:
+                    work_id = str(work["id"])
+                    if work_id not in seen:
+                        seen[work_id] = None
+                        added_count += 1
+            save_seen_ids(seen)
+            self.enqueue_log(
+                f"已讀取 {result_count} 筆 API 結果，新增 {added_count} 筆至 seen_id.json（最多保留 {MAX_SEEN_IDS} 筆）。"
+            )
+        except requests.HTTPError as exc:
+            status_code = exc.response.status_code if exc.response is not None else None
+            if status_code == 401:
+                self.enqueue_log(
+                    "添加 API 結果失敗：PHPSESSID 已失效或不正確。請重新取得並儲存 PHPSESSID。"
+                )
+            else:
+                self.enqueue_log(f"添加 API 結果失敗（HTTP {status_code or '未知'}）：{exc}")
+        except (requests.RequestException, KeyError, TypeError, ValueError) as exc:
+            self.enqueue_log(f"添加 API 結果失敗：{exc}")
+        finally:
+            self.after(0, self.finish_adding_api_results)
+
+    def finish_adding_api_results(self) -> None:
+        self.api_add_in_progress = False
+        self.start_button.configure(state="normal")
+        self.add_api_results_button.configure(state="normal")
+        self.status.set("狀態：未啟動")
 
     def collect_settings(self) -> Settings:
         values = {key: entry.get().strip() for key, entry in self.entries.items()}
@@ -528,6 +697,7 @@ class Application(tk.Tk):
         else:
             self.start_button.configure(state="normal")
             self.stop_button.configure(state="disabled")
+            self.add_api_results_button.configure(state="normal")
             self.status.set("狀態：未啟動")
 
     def enqueue_log(self, message: str) -> None:
