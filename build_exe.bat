@@ -13,4 +13,4 @@ if errorlevel 1 (
 )
 echo.
 echo Done: dist\PixivAutoStamp.exe
-pause
+exit /b 0
