@@ -40,6 +40,7 @@ ACTIVITY_REQUEST_DELAY_SECONDS = 0.6
 ACTIVITY_COMMENT_PAGE_SIZE = 30
 STAMP_PRIMARY_WAIT_SECONDS = (5, 1, 1)
 STAMP_STEP_DELAY_SECONDS = (0.35, 0.35, 0)
+BROWSER_PAGE_LOAD_TIMEOUT_SECONDS = 15
 AUTOSTART_REGISTRY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 AUTOSTART_VALUE_NAME = "PixivAutoStamp"
 SINGLE_INSTANCE_MUTEX_NAME = r"Local\PixivAutoStampExecute"
@@ -440,7 +441,13 @@ class PixivWorker:
         import undetected_chromedriver as uc
 
         options = uc.ChromeOptions()
+        # Pixiv can keep non-essential page resources loading for a long time.
+        # The stamp controls only require DOMContentLoaded, not a fully idle page.
+        options.page_load_strategy = "eager"
         options.add_argument("--disable-gpu")
+        options.add_argument("--disable-extensions")
+        options.add_argument("--no-first-run")
+        options.add_argument("--no-default-browser-check")
         chrome_major = self.detect_chrome_major_version()
         if chrome_major is None:
             self.log("無法偵測 Chrome 版本，將由驅動程式自動選擇版本。")
@@ -448,7 +455,7 @@ class PixivWorker:
         else:
             self.log(f"偵測到 Chrome {chrome_major}，正在下載／使用相符的 ChromeDriver…")
             self.driver = uc.Chrome(version_main=chrome_major, options=options)
-        self.driver.set_page_load_timeout(30)
+        self.driver.set_page_load_timeout(BROWSER_PAGE_LOAD_TIMEOUT_SECONDS)
         self.driver.get("https://www.pixiv.net/")
         if self.stop_event.wait(2):
             return
@@ -473,6 +480,7 @@ class PixivWorker:
         return None
 
     def click_stamp(self, work_id: str) -> bool:
+        from selenium.common.exceptions import TimeoutException
         from selenium.webdriver.common.by import By
         from selenium.webdriver.support import expected_conditions as EC
         from selenium.webdriver.support.ui import WebDriverWait
@@ -523,8 +531,15 @@ class PixivWorker:
                 if self.stop_event.wait(STAMP_STEP_DELAY_SECONDS[index - 1]):
                     return False
             return True
+        except TimeoutException:
+            self.log(
+                "Pixiv 頁面載入逾時，已關閉故障瀏覽器；下次輪詢將重新建立瀏覽器後重試。"
+            )
+            self.close_driver()
+            return False
         except Exception as exc:
             self.log(f"瀏覽器操作失敗：{exc}")
+            self.close_driver()
             return False
 
     def close_driver(self) -> None:
@@ -617,7 +632,7 @@ class Application(tk.Tk):
                     text="Firefox 無痕開啟 Pixiv",
                     command=self.open_pixiv_in_private_firefox,
                 ).pack(side="left")
-                self.notes_text = tk.Text(settings_frame, height=2, wrap="word", font=("Microsoft JhengHei UI", 10))
+                self.notes_text = tk.Text(settings_frame, height=3, wrap="word", font=("Microsoft JhengHei UI", 10))
                 self.notes_text.insert("1.0", self.settings.notes)
                 self.notes_text.grid(row=row, column=1, sticky="ew", pady=3)
                 row += 1
