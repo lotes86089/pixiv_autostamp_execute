@@ -3,3 +3,4 @@ build/
 *.spec
 dist/config.json
 dist/seen_id.json
+dist/notification_seen_id.json

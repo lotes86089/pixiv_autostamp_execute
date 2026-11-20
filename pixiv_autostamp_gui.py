@@ -7,8 +7,10 @@ credentials are not embedded in the distributable program.
 from __future__ import annotations
 
 import ctypes
+import html
 import json
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -22,7 +24,7 @@ from datetime import datetime
 from ctypes import wintypes
 from pathlib import Path
 from typing import Callable
-from urllib.parse import quote
+from urllib.parse import quote, urljoin
 
 import requests
 import tkinter as tk
@@ -34,6 +36,8 @@ from tkinter import messagebox, ttk
 APP_NAME = "Pixiv 自動貼圖"
 POLL_INTERVAL_SECONDS = 30
 MAX_SEEN_IDS = 1000
+NOTIFICATION_POLL_INTERVAL_SECONDS = 60
+MAX_NOTIFICATION_SEEN_IDS = 1000
 SEARCH_RETRY_DELAYS_SECONDS = (2, 5)
 ACTIVITY_REQUEST_DELAY_SECONDS = 0.6
 # Keep this conservative: the comments API can reject overly large pages.
@@ -78,6 +82,27 @@ def show_existing_window() -> None:
         time.sleep(0.1)
 
 
+def active_window_handle() -> wintypes.HWND:
+    """Return the current foreground window so Chrome can yield focus to it."""
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.GetForegroundWindow.argtypes = ()
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    return user32.GetForegroundWindow()
+
+
+def restore_active_window(window_handle: wintypes.HWND) -> None:
+    """Put the user's prior window back in front after launching Chrome."""
+    if not window_handle:
+        return
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.IsWindow.argtypes = (wintypes.HWND,)
+    user32.IsWindow.restype = wintypes.BOOL
+    user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
+    user32.SetForegroundWindow.restype = wintypes.BOOL
+    if user32.IsWindow(window_handle):
+        user32.SetForegroundWindow(window_handle)
+
+
 def acquire_single_instance() -> bool:
     """Return False when another instance is already running."""
     global _single_instance_mutex
@@ -100,8 +125,10 @@ def acquire_single_instance() -> bool:
 
 CONFIG_PATH = app_directory() / "config.json"
 STATE_PATH = app_directory() / "seen_id.json"
+NOTIFICATION_STATE_PATH = app_directory() / "notification_seen_id.json"
 APP_ICON_PATH = resource_path("pixiv_autostamp_icon.png")
 PIXIV_HOME_URL = "https://www.pixiv.net/"
+PIXIV_NOTIFICATION_URL = "https://www.pixiv.net/ajax/notification"
 
 
 def search_api_url(keyword: str) -> str:
@@ -149,6 +176,26 @@ def load_seen_ids() -> dict[str, None]:
 def save_seen_ids(seen: dict[str, None]) -> None:
     """Keep only the most recently added IDs in processing order."""
     STATE_PATH.write_text(json.dumps(list(seen)[-MAX_SEEN_IDS:]), encoding="utf-8")
+
+
+def load_notification_seen_ids() -> dict[str, None] | None:
+    """Load notification IDs, or None when no baseline has been created yet."""
+    if not NOTIFICATION_STATE_PATH.exists():
+        return None
+    try:
+        return dict.fromkeys(
+            str(notification_id)
+            for notification_id in json.loads(NOTIFICATION_STATE_PATH.read_text(encoding="utf-8"))
+        )
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+
+
+def save_notification_seen_ids(seen: dict[str, None]) -> None:
+    """Retain enough notification IDs to avoid duplicate Telegram alerts."""
+    NOTIFICATION_STATE_PATH.write_text(
+        json.dumps(list(seen)[-MAX_NOTIFICATION_SEEN_IDS:]), encoding="utf-8"
+    )
 
 
 def firefox_executable() -> Path | None:
@@ -206,6 +253,7 @@ class Settings:
     notes: str = ""
     excluded_user_ids: str = ""
     auto_start_on_login: bool = False
+    telegram_pixiv_notifications: bool = False
 
     @classmethod
     def load(cls) -> "Settings":
@@ -265,6 +313,7 @@ class PixivWorker:
         self.stop_event = stop_event
         self.driver = None
         self.session = create_pixiv_session(settings.php_sessid)
+        self.next_notification_check = 0.0
 
     def run(self) -> None:
         self.log("服務已啟動，將每 30 秒檢查一次新作品。")
@@ -295,6 +344,7 @@ class PixivWorker:
     def check_once(self) -> None:
         if self.stop_event.is_set():
             return
+        self.check_notifications_if_due()
         seen = self.load_seen()
         found_new_work = False
         excluded_user_ids = self.settings.excluded_user_id_set()
@@ -362,6 +412,73 @@ class PixivWorker:
         # once this polling round has handled every new work.
         self.close_driver()
 
+    def check_notifications_if_due(self) -> None:
+        """Send Telegram alerts for newly received unread Pixiv notifications."""
+        if not self.settings.telegram_pixiv_notifications:
+            return
+        if time.monotonic() < self.next_notification_check:
+            return
+        # Advance the schedule even for a temporary failure so notification
+        # polling remains low frequency and does not compete with searches.
+        self.next_notification_check = time.monotonic() + NOTIFICATION_POLL_INTERVAL_SECONDS
+        try:
+            response = self.session.get(PIXIV_NOTIFICATION_URL, timeout=15)
+            response.raise_for_status()
+            body = response.json().get("body", {})
+            items = body.get("items", []) if isinstance(body, dict) else []
+            if not isinstance(items, list):
+                raise ValueError("Pixiv 通知回應格式不正確")
+        except requests.HTTPError:
+            raise
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            self.log(f"讀取 Pixiv 通知失敗：{exc}；將於 60 秒後重試。")
+            return
+
+        current_ids = [str(item["id"]) for item in items if isinstance(item, dict) and item.get("id")]
+        seen = load_notification_seen_ids()
+        if seen is None:
+            save_notification_seen_ids(dict.fromkeys(current_ids))
+            unread_count = sum(
+                1 for item in items if isinstance(item, dict) and item.get("unread")
+            )
+            self.log(f"Pixiv 通知監控已建立基準（目前 {unread_count} 則未讀通知，不補發）。")
+            return
+
+        new_items = [
+            item
+            for item in items
+            if isinstance(item, dict)
+            and item.get("id")
+            and str(item["id"]) not in seen
+            and item.get("unread")
+        ]
+        new_ids = {str(item["id"]) for item in new_items}
+        delivered_ids: set[str] = set()
+        for item in reversed(new_items):
+            if self.notify_pixiv_notification(item):
+                delivered_ids.add(str(item["id"]))
+        for notification_id in current_ids:
+            if notification_id not in new_ids or notification_id in delivered_ids:
+                seen[notification_id] = None
+        save_notification_seen_ids(seen)
+        if new_items:
+            self.log(
+                f"偵測到 {len(new_items)} 則新的未讀 Pixiv 通知，"
+                f"成功發送 {len(delivered_ids)} 則 Telegram 提醒。"
+            )
+
+    def notify_pixiv_notification(self, item: dict[str, object]) -> bool:
+        """Format a Pixiv notification as plain text for Telegram."""
+        content = html.unescape(re.sub(r"<[^>]+>", "", str(item.get("content") or ""))).strip()
+        notification_type = str(item.get("type") or "未知")
+        notified_at = format_upload_datetime(item.get("notifiedAt"))
+        link_value = str(item.get("linkUrl") or "")
+        link_url = urljoin(PIXIV_HOME_URL, link_value) if link_value else PIXIV_HOME_URL
+        return self.notify(
+            f"【Pixiv 新通知】\n\n{content or '（通知內容未提供）'}\n"
+            f"類型: {notification_type}\n時間: {notified_at}\n\n{link_url}"
+        )
+
     def get_search_response(self, url: str, keyword: str) -> requests.Response | None:
         """Fetch a search page with brief retries for temporary network resets."""
         attempt_count = len(SEARCH_RETRY_DELAYS_SECONDS) + 1
@@ -417,10 +534,10 @@ class PixivWorker:
             f"作者已關閉評論，無法貼圖。\n\n{work_url}"
         )
 
-    def notify(self, text: str) -> None:
+    def notify(self, text: str) -> bool:
         if not self.settings.telegram_bot_token or not self.settings.telegram_chat_id:
             self.log("未設定 Telegram，略過通知。")
-            return
+            return False
         try:
             response = requests.post(
                 f"https://api.telegram.org/bot{self.settings.telegram_bot_token}/sendMessage",
@@ -428,8 +545,10 @@ class PixivWorker:
             )
             response.raise_for_status()
             self.log("Telegram 通知已發送。")
+            return True
         except requests.RequestException as exc:
             self.log(f"Telegram 通知失敗：{exc}")
+            return False
 
     def load_seen(self) -> dict[str, None]:
         return load_seen_ids()
@@ -440,6 +559,7 @@ class PixivWorker:
     def init_driver(self) -> None:
         import undetected_chromedriver as uc
 
+        previous_window = active_window_handle()
         options = uc.ChromeOptions()
         # Pixiv can keep non-essential page resources loading for a long time.
         # The stamp controls only require DOMContentLoaded, not a fully idle page.
@@ -455,6 +575,7 @@ class PixivWorker:
         else:
             self.log(f"偵測到 Chrome {chrome_major}，正在下載／使用相符的 ChromeDriver…")
             self.driver = uc.Chrome(version_main=chrome_major, options=options)
+        restore_active_window(previous_window)
         self.driver.set_page_load_timeout(BROWSER_PAGE_LOAD_TIMEOUT_SECONDS)
         self.driver.get("https://www.pixiv.net/")
         if self.stop_event.wait(2):
@@ -609,6 +730,9 @@ class Application(tk.Tk):
         settings_frame.pack(fill="x")
         self.entries: dict[str, ttk.Entry] = {}
         self.auto_start_on_login = tk.BooleanVar(value=self.settings.auto_start_on_login)
+        self.telegram_pixiv_notifications = tk.BooleanVar(
+            value=self.settings.telegram_pixiv_notifications
+        )
         ttk.Checkbutton(
             settings_frame,
             text="開機後自動啟動監控",
@@ -636,6 +760,12 @@ class Application(tk.Tk):
                 self.notes_text.insert("1.0", self.settings.notes)
                 self.notes_text.grid(row=row, column=1, sticky="ew", pady=3)
                 row += 1
+        ttk.Checkbutton(
+            settings_frame,
+            text="Telegram 提醒 Pixiv 新通知（每 60 秒檢查一次）",
+            variable=self.telegram_pixiv_notifications,
+        ).grid(row=row, column=1, sticky="w", pady=(5, 3))
+        row += 1
         keyword_label = ttk.Frame(settings_frame)
         keyword_label.grid(row=row, column=0, sticky="nw", padx=(0, 8), pady=3)
         ttk.Label(keyword_label, text="關鍵字", width=20).pack(anchor="w")
@@ -1069,6 +1199,7 @@ class Application(tk.Tk):
         values["keyword"] = self.keywords_text.get("1.0", "end-1c")
         values["excluded_user_ids"] = self.excluded_user_ids_text.get("1.0", "end-1c")
         values["auto_start_on_login"] = self.auto_start_on_login.get()
+        values["telegram_pixiv_notifications"] = self.telegram_pixiv_notifications.get()
         return Settings(**values)
 
     def persist_settings(self, settings: Settings) -> bool:
